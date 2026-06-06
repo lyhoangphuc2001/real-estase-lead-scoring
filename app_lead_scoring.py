@@ -1,0 +1,547 @@
+import streamlit as st
+import pandas as pd
+import google.generativeai as genai
+import json
+import io
+import os
+from dotenv import load_dotenv
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
+# Load environment variables
+load_dotenv()
+
+# Page configuration
+st.set_page_config(
+    page_title="Real Estate Lead Scoring & Automation",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom premium styling
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Plus Jakarta Sans', sans-serif;
+}
+
+.main-title {
+    background: linear-gradient(135deg, #10B981, #3B82F6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-size: 2.5rem;
+    font-weight: 700;
+    margin-bottom: 0.2rem;
+    text-shadow: 0px 4px 20px rgba(16, 185, 129, 0.1);
+}
+
+.sub-title {
+    color: #6B7280;
+    font-size: 1.1rem;
+    margin-bottom: 2rem;
+    font-weight: 400;
+}
+
+.kpi-container {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+.kpi-card {
+    flex: 1;
+    background: white;
+    border-radius: 16px;
+    padding: 1.25rem;
+    box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05);
+    border: 1px solid #F3F4F6;
+    text-align: center;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.kpi-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.08);
+}
+
+.kpi-card-total { border-top: 5px solid #6B7280; }
+.kpi-card-vip { border-top: 5px solid #10B981; }
+.kpi-card-normal { border-top: 5px solid #3B82F6; }
+.kpi-card-junk { border-top: 5px solid #EF4444; }
+
+.kpi-title {
+    font-size: 0.85rem;
+    color: #4B5563;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.3rem;
+}
+
+.kpi-value {
+    font-size: 2.2rem;
+    font-weight: 700;
+    margin: 0;
+}
+
+.kpi-value-total { color: #111827; }
+.kpi-value-vip { color: #10B981; }
+.kpi-value-normal { color: #3B82F6; }
+.kpi-value-junk { color: #EF4444; }
+
+/* Dark mode adjustments */
+@media (prefers-color-scheme: dark) {
+    .kpi-card {
+        background: #1F2937;
+        border-color: #374151;
+        box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.3);
+    }
+    .kpi-card:hover {
+        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+    }
+    .kpi-title {
+        color: #9CA3AF;
+    }
+    .kpi-value-total {
+        color: #F9FAFB;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
+
+# Helper function to convert Google Sheet edit link to CSV export link
+def get_csv_url(sheet_url):
+    if "docs.google.com/spreadsheets" in sheet_url:
+        try:
+            parts = sheet_url.split("/d/")
+            if len(parts) > 1:
+                doc_id = parts[1].split("/")[0]
+                return f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv"
+        except Exception:
+            pass
+    return sheet_url
+
+# Helper to fetch data with caching
+@st.cache_data(show_spinner="Đang tải dữ liệu từ Google Sheets...")
+def load_sheet_data(url):
+    csv_url = get_csv_url(url)
+    try:
+        df = pd.read_csv(csv_url)
+        # Check required columns
+        required = ['id', 'ten_khach', 'sdt', 'nhu_cau_mo_ta']
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            st.error(f"Google Sheet thiếu các cột bắt buộc: {', '.join(missing)}")
+            return None
+            
+        # Add default AI columns if not present
+        if 'diem' not in df.columns:
+            df['diem'] = 0
+        else:
+            df['diem'] = df['diem'].fillna(0).astype(int)
+            
+        if 'phan_loai' not in df.columns:
+            df['phan_loai'] = "Bình thường"
+        else:
+            df['phan_loai'] = df['phan_loai'].fillna("Bình thường")
+            
+        if 'ly_do_chi_tiet' not in df.columns:
+            df['ly_do_chi_tiet'] = "Chưa chấm điểm (Chưa chạy AI)"
+        else:
+            df['ly_do_chi_tiet'] = df['ly_do_chi_tiet'].fillna("Chưa chấm điểm (Chưa chạy AI)")
+            
+        return df
+    except Exception as e:
+        st.error(f"Không thể tải dữ liệu từ URL Google Sheet. Chi tiết lỗi: {str(e)}")
+        return None
+
+# Helper to score a single lead using Gemini API
+def score_single_lead(model, client_name, desc, prompt_template):
+    prompt = prompt_template.format(ten_khach=client_name, nhu_cau_mo_ta=desc)
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        data = json.loads(response.text)
+        score = int(data.get("diem", 0))
+        classification = str(data.get("phan_loai", "Bình thường"))
+        reason = str(data.get("ly_do", "Không có lý do chi tiết."))
+        return score, classification, reason
+    except Exception as e:
+        return 0, "Bình thường", f"Lỗi gọi API: {str(e)}"
+
+# Helper to style and export to Excel using openpyxl
+def export_to_excel(df):
+    output = io.BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Lead Scoring Reports"
+    
+    ws.views.sheetView[0].showGridLines = True
+    
+    headers = ["ID", "Tên Khách Hàng", "Số Điện Thoại", "Mô Tả Nhu Cầu", "Điểm Số", "Phân Loại", "Lý Do Chi Tiết"]
+    ws.append(headers)
+    
+    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+    thin_border_side = Side(border_style="thin", color="D3D3D3")
+    cell_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
+    
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = cell_border
+        
+    ws.row_dimensions[1].height = 28
+    
+    vip_fill = PatternFill(start_color="D1E7DD", end_color="D1E7DD", fill_type="solid")
+    vip_font = Font(name="Segoe UI", size=10, color="0F5132", bold=True)
+    
+    normal_fill = PatternFill(start_color="E2F0D9", end_color="E2F0D9", fill_type="solid")
+    normal_font = Font(name="Segoe UI", size=10, color="385723", bold=True)
+    
+    junk_fill = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
+    junk_font = Font(name="Segoe UI", size=10, color="842029", bold=True)
+    
+    for r_idx, row in enumerate(df.itertuples(index=False), start=2):
+        ws.append([
+            row.id,
+            row.ten_khach,
+            str(row.sdt),
+            row.nhu_cau_mo_ta,
+            row.diem,
+            row.phan_loai,
+            row.ly_do_chi_tiet
+        ])
+        ws.row_dimensions[r_idx].height = 24
+        
+        for col_idx in range(1, len(headers) + 1):
+            cell = ws.cell(row=r_idx, column=col_idx)
+            cell.border = cell_border
+            cell.font = Font(name="Segoe UI", size=10)
+            
+            if col_idx in [1, 3, 5, 6]:  # ID, SĐT, Điểm, Phân Loại
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+                
+            if col_idx == 6:  # Phân loại highlight
+                val = str(cell.value)
+                if val == "VIP":
+                    cell.fill = vip_fill
+                    cell.font = vip_font
+                elif val == "Rác":
+                    cell.fill = junk_fill
+                    cell.font = junk_font
+                else:
+                    cell.fill = normal_fill
+                    cell.font = normal_font
+                    
+    column_widths = {
+        1: 8,   # ID
+        2: 22,  # Tên Khách Hàng
+        3: 15,  # SĐT
+        4: 55,  # Mô Tả Nhu Cầu
+        5: 10,  # Điểm Số
+        6: 15,  # Phân Loại
+        7: 45   # Lý Do Chi Tiết
+    }
+    
+    for col_idx, width in column_widths.items():
+        col_letter = get_column_letter(col_idx)
+        ws.column_dimensions[col_letter].width = width
+        
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+# Sidebar Setup
+st.sidebar.markdown("### ⚙️ Cấu Hình Hệ Thống")
+
+# Google Sheet link setup
+default_sheet = "https://docs.google.com/spreadsheets/d/1joAy1H6PU19kwgsn57CSk_8cdci6vcDmME21CV_4n6E/edit?usp=sharing"
+sheet_url = st.sidebar.text_input(
+    "URL Google Sheets:",
+    value=default_sheet,
+    help="Dán URL Google Sheet chứa danh sách khách hàng của bạn."
+)
+
+# API key setup
+gemini_key = st.sidebar.text_input(
+    "Gemini API Key:",
+    value=os.getenv("GEMINI_API_KEY", ""),
+    type="password",
+    help="Nhập Gemini API Key của bạn để sử dụng trí tuệ nhân tạo."
+)
+
+# Load data into session state
+if "master_df" not in st.session_state:
+    df_raw = load_sheet_data(sheet_url)
+    if df_raw is not None:
+        st.session_state.master_df = df_raw.copy()
+        st.session_state.original_df = df_raw.copy()
+    else:
+        st.session_state.master_df = None
+        st.session_state.original_df = None
+
+# Refresh button to force clear cache and re-download
+if st.sidebar.button("🔄 Tải lại/Đồng bộ Google Sheets", use_container_width=True):
+    st.cache_data.clear()
+    df_raw = load_sheet_data(sheet_url)
+    if df_raw is not None:
+        st.session_state.master_df = df_raw.copy()
+        st.session_state.original_df = df_raw.copy()
+        st.success("Đồng bộ Google Sheet thành công!")
+        st.rerun()
+
+# Default prompt template editable in sidebar
+st.sidebar.markdown("### 📝 AI System Prompt Customizer")
+default_prompt = """Bạn là chuyên gia phân tích dữ liệu và chấm điểm khách hàng tiềm năng (Lead Scoring) trong ngành Bất Động Sản.
+Nhiệm vụ của bạn là phân tích đoạn mô tả nhu cầu khách hàng dưới đây và đưa ra đánh giá dựa trên bộ quy tắc chính xác sau:
+
+1. QUY TẮC CỘNG 50 ĐIỂM (Khách hàng VIP/Siêu tiềm năng - Phân loại: "VIP"):
+- Ngân sách lớn: Có đề cập đến số tiền từ 20 tỷ trở lên hoặc các cụm từ "tài chính mạnh", "ngân sách không thành vấn đề", "ngân sách trên 30 tỷ", "thanh toán thẳng".
+- Loại hình cao cấp: Tìm kiếm "Biệt thự đơn lập", "Penthouse", "Shophouse mặt đường lớn", "Quỹ đất công nghiệp", "Sàn văn phòng diện tích lớn" (hoặc diện tích > 2000m2).
+- Vị trí đắc địa: Yêu cầu các khu vực như "Quận 1", "Ven sông", "Vinhomes Ocean Park", "Phú Mỹ Hưng", "khu Đông".
+- Đối tượng khách hàng: Đề cập là "Chủ doanh nghiệp", "Nhà đầu tư chuyên nghiệp", "Mua sỉ", "Mua số lượng lớn", "gom sỉ 5-10 căn".
+- Tính cấp thiết & Minh bạch: Yêu cầu "Pháp lý chuẩn 100%", "Sổ hồng riêng", "Muốn gặp trực tiếp chủ đầu tư để đàm phán", "cần gặp trực tiếp giám đốc dự án".
+
+2. QUY TẮC TRỪ 50 ĐIỂM (Khách hàng Rác/Không tiềm năng - Phân loại: "Rác"):
+- Yêu cầu phi thực tế: Tìm mua bất động sản với giá thấp vô lý so với thị trường (VD: Nhà Quận 1 giá 1-2 tỷ, nhà trung tâm có sân vườn hồ bơi giá vài trăm triệu, tìm nhà thuê nguyên căn giá 2 triệu ở trung tâm thành phố).
+- Không có nhu cầu: "Nhầm số", "Không có nhu cầu", "Dữ liệu cũ", "Nhầm ngành".
+- Khách hàng không thiện chí: "Hỏi giá cho vui", "Chưa có ý định mua", "Thái độ không hợp tác".
+- Spam/Quảng cáo: Nội dung chứa các dịch vụ khác như "Bảo hiểm", "Vay vốn", "Mời chào dịch vụ", "quảng cáo ngược lại dịch vụ bảo hiểm".
+- Thông tin liên lạc lỗi: "Thuê bao", "Gọi nhiều lần không bắt máy", "Không phản hồi Zalo".
+
+3. CÁC TRƯỜNG HỢP KHÁC (Giữ nguyên điểm hoặc cộng ít - Phân loại: "Bình thường" - Điểm: 0):
+- Khách hàng tìm mua chung cư, nhà phố tầm trung (3-10 tỷ).
+- Khách hàng cần vay ngân hàng, đang cân nhắc chính sách (ví dụ: cần hỗ trợ vay ngân hàng 70%).
+- Khách hàng có nhu cầu thực nhưng cần tư vấn thêm về pháp lý hoặc vị trí.
+- Thuê mặt bằng kinh doanh spa Quận 1 diện tích khoảng 80-100m2, giá thuê mong muốn dưới 50 triệu/tháng.
+- Cần mua đất nền vùng ven (Long An, Đồng Nai) để đầu tư dài hạn với tài chính 2-3 tỷ.
+
+Thông tin khách hàng cần phân tích:
+- Tên khách: {ten_khach}
+- Mô tả nhu cầu: {nhu_cau_mo_ta}
+
+Hãy trả về kết quả dưới dạng JSON duy nhất với cấu trúc sau:
+{{
+  "diem": [Điểm số: 50, 0, hoặc -50],
+  "phan_loai": "[VIP / Bình thường / Rác]",
+  "ly_do": "[Giải thích chi tiết lý do chấm điểm và nhận diện từ khóa/ngữ cảnh]"
+}}"""
+
+system_prompt = st.sidebar.text_area(
+    "AI Prompt Template:",
+    value=default_prompt,
+    height=250,
+    help="Bạn có thể chỉnh sửa cấu trúc chấm điểm AI tại đây trước khi chạy."
+)
+
+# Run AI scoring button
+if st.sidebar.button("⚡ Chạy AI Chấm Điểm (Lead Scoring)", use_container_width=True):
+    if not gemini_key:
+        st.sidebar.error("⚠️ Vui lòng cung cấp Gemini API Key để tiếp tục!")
+    elif st.session_state.master_df is None:
+        st.sidebar.error("⚠️ Không có dữ liệu khách hàng để chấm điểm!")
+    else:
+        try:
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            
+            # Master storage copy
+            df_to_score = st.session_state.master_df.copy()
+            
+            total_leads = len(df_to_score)
+            progress_bar = st.sidebar.progress(0)
+            status_text = st.sidebar.empty()
+            
+            for i in range(total_leads):
+                row = df_to_score.iloc[i]
+                status_text.text(f"Đang phân tích {i+1}/{total_leads}: {row['ten_khach']}")
+                
+                score, classification, reason = score_single_lead(
+                    model,
+                    row['ten_khach'],
+                    row['nhu_cau_mo_ta'],
+                    system_prompt
+                )
+                
+                df_to_score.at[i, 'diem'] = score
+                df_to_score.at[i, 'phan_loai'] = classification
+                df_to_score.at[i, 'ly_do_chi_tiet'] = reason
+                
+                progress_bar.progress((i + 1) / total_leads)
+                
+            st.session_state.master_df = df_to_score.copy()
+            status_text.text("🎉 Đã hoàn tất chấm điểm bằng AI!")
+            st.success("Chấm điểm thành công! Hãy kiểm duyệt và hiệu chỉnh kết quả bên dưới.")
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Lỗi hệ thống: {str(e)}")
+
+# MAIN INTERFACE
+st.markdown('<div class="main-title">🎯 AI Lead Scoring & Automation System</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Phân tích nhu cầu khách hàng, tự động chấm điểm và kiểm duyệt Human-in-the-Loop</div>', unsafe_allow_html=True)
+
+if st.session_state.master_df is not None:
+    # Compute dynamic statistics from master_df
+    df_stats = st.session_state.master_df
+    total_count = len(df_stats)
+    vip_count = len(df_stats[df_stats['phan_loai'] == 'VIP'])
+    normal_count = len(df_stats[df_stats['phan_loai'] == 'Bình thường'])
+    junk_count = len(df_stats[df_stats['phan_loai'] == 'Rác'])
+    
+    # Render premium metrics cards
+    st.markdown(f"""
+    <div class="kpi-container">
+        <div class="kpi-card kpi-card-total">
+            <div class="kpi-title">Tổng số khách hàng</div>
+            <div class="kpi-value kpi-value-total">{total_count}</div>
+        </div>
+        <div class="kpi-card kpi-card-vip">
+            <div class="kpi-title">Khách hàng VIP / Siêu Tiềm Năng</div>
+            <div class="kpi-value kpi-value-vip">{vip_count}</div>
+        </div>
+        <div class="kpi-card kpi-card-normal">
+            <div class="kpi-title">Tiềm năng trung bình</div>
+            <div class="kpi-value kpi-value-normal">{normal_count}</div>
+        </div>
+        <div class="kpi-card kpi-card-junk">
+            <div class="kpi-title">Khách Rác / Không Tiềm Năng</div>
+            <div class="kpi-value kpi-value-junk">{junk_count}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Business Rules Expander
+    with st.expander("📖 Xem Quy tắc & Hướng dẫn chấm điểm nghiệp vụ (Business Rules)", expanded=False):
+        st.markdown("""
+        **1. TIÊU CHÍ CỘNG 50 ĐIỂM (KHÁCH HÀNG VIP/SIÊU TIỀM NĂNG)**
+        - **Ngân sách lớn**: >= 20 tỷ VNĐ hoặc các cụm từ: "tài chính mạnh", "ngân sách không thành vấn đề".
+        - **Loại hình cao cấp**: "Biệt thự đơn lập", "Penthouse", "Shophouse mặt đường lớn", "Quỹ đất công nghiệp", "Sàn văn phòng diện tích lớn".
+        - **Vị trí đắc địa**: "Quận 1", "Ven sông", "Vinhomes Ocean Park", "Phú Mỹ Hưng".
+        - **Đối tượng khách hàng**: "Chủ doanh nghiệp", "Nhà đầu tư chuyên nghiệp", "Mua sỉ", "Mua số lượng lớn".
+        - **Tính cấp thiết & Minh bạch**: "Pháp lý chuẩn 100%", "Sổ hồng riêng", "Muốn gặp trực tiếp chủ đầu tư để đàm phán".
+        
+        **2. TIÊU CHÍ TRỪ 50 ĐIỂM (KHÁCH HÀNG RÁC/KHÔNG TIỀM NĂNG)**
+        - **Yêu cầu phi thực tế**: Mua bđs giá thấp vô lý (VD: Nhà Q1 giá 1-2 tỷ, nhà trung tâm có sân vườn hồ bơi giá vài trăm triệu, thuê nhà trung tâm giá 2 triệu).
+        - **Không có nhu cầu**: "Nhầm số", "Không có nhu cầu", "Dữ liệu cũ", "Nhầm ngành".
+        - **Khách không thiện chí**: "Hỏi giá cho vui", "Chưa có ý định mua", "Thái độ không hợp tác".
+        - **Spam/Quảng cáo**: "Bảo hiểm", "Vay vốn", "Mời chào dịch vụ".
+        - **Thông tin lỗi**: "Thuê bao", "Gọi nhiều lần không bắt máy", "Không phản hồi Zalo".
+        
+        **3. CÁC TRƯỜNG HỢP KHÁC (GIỮ NGUYÊN 0 ĐIỂM)**
+        - Chung cư, nhà phố tầm trung (3-10 tỷ).
+        - Khách cần vay ngân hàng, đang cân nhắc chính sách.
+        - Khách có nhu cầu thực nhưng cần tư vấn thêm về pháp lý hoặc vị trí.
+        """)
+        
+    # Filters Section
+    st.markdown("### 🔍 Bộ lọc & Kiểm duyệt kết quả (Human-In-The-Loop)")
+    col_search, col_filter, col_reset = st.columns([2, 1, 1])
+    
+    with col_search:
+        search_query = st.text_input("Tìm kiếm theo Tên hoặc Mô tả nhu cầu:", "")
+        
+    with col_filter:
+        filter_class = st.selectbox("Lọc phân loại khách hàng:", ["Tất cả", "VIP", "Bình thường", "Rác"])
+        
+    with col_reset:
+        st.write(" ")
+        st.write(" ")
+        if st.button("🔄 Khôi phục dữ liệu ban đầu", use_container_width=True, help="Hủy bỏ mọi thay đổi chỉnh sửa thủ công"):
+            st.session_state.master_df = st.session_state.original_df.copy()
+            st.success("Đã khôi phục dữ liệu gốc!")
+            st.rerun()
+            
+    # Filter the displayed data
+    display_df = st.session_state.master_df.copy()
+    if search_query:
+        display_df = display_df[
+            display_df['ten_khach'].str.contains(search_query, case=False, na=False) |
+            display_df['nhu_cau_mo_ta'].str.contains(search_query, case=False, na=False)
+        ]
+    if filter_class != "Tất cả":
+        display_df = display_df[display_df['phan_loai'] == filter_class]
+        
+    # Data editor for human review
+    st.info("💡 Mẹo: Bạn có thể nhấp đôi chuột vào ô **Điểm**, **Phân Loại** hoặc **Lý do chi tiết** bên dưới để chỉnh sửa trực tiếp. Điểm sẽ tự đồng bộ với Phân Loại tương ứng.")
+    
+    # Configure columns
+    edited_display_df = st.data_editor(
+        display_df,
+        column_config={
+            "id": st.column_config.NumberColumn("ID", disabled=True),
+            "ten_khach": st.column_config.TextColumn("Họ & Tên", disabled=True),
+            "sdt": st.column_config.TextColumn("Số Điện Thoại", disabled=True),
+            "nhu_cau_mo_ta": st.column_config.TextColumn("Mô tả nhu cầu", disabled=True, width="large"),
+            "diem": st.column_config.NumberColumn("Điểm số", min_value=-50, max_value=50, step=50),
+            "phan_loai": st.column_config.SelectboxColumn(
+                "Phân loại",
+                options=["VIP", "Bình thường", "Rác"],
+                required=True
+            ),
+            "ly_do_chi_tiet": st.column_config.TextColumn("Lý do chi tiết (Ghi chú)", width="large")
+        },
+        use_container_width=True,
+        num_rows="fixed",
+        key="leads_editor_key"
+    )
+    
+    # Synchronize edits back to st.session_state.master_df using relative index to unique 'id'
+    if "leads_editor_key" in st.session_state:
+        edits = st.session_state.leads_editor_key
+        if edits and "edited_rows" in edits and edits["edited_rows"]:
+            has_changes = False
+            for rel_idx_str, changes in edits["edited_rows"].items():
+                rel_idx = int(rel_idx_str)
+                if rel_idx < len(display_df):
+                    actual_id = display_df.iloc[rel_idx]['id']
+                    
+                    for col, val in changes.items():
+                        # Automatic classification sync if score is changed
+                        if col == 'diem':
+                            val = int(val)
+                            if val >= 50:
+                                st.session_state.master_df.loc[st.session_state.master_df['id'] == actual_id, 'phan_loai'] = "VIP"
+                            elif val <= -50:
+                                st.session_state.master_df.loc[st.session_state.master_df['id'] == actual_id, 'phan_loai'] = "Rác"
+                            else:
+                                st.session_state.master_df.loc[st.session_state.master_df['id'] == actual_id, 'phan_loai'] = "Bình thường"
+                                
+                        # Automatic score sync if classification is changed
+                        if col == 'phan_loai':
+                            if val == "VIP":
+                                st.session_state.master_df.loc[st.session_state.master_df['id'] == actual_id, 'diem'] = 50
+                            elif val == "Rác":
+                                st.session_state.master_df.loc[st.session_state.master_df['id'] == actual_id, 'diem'] = -50
+                            else:
+                                st.session_state.master_df.loc[st.session_state.master_df['id'] == actual_id, 'diem'] = 0
+                                
+                        st.session_state.master_df.loc[st.session_state.master_df['id'] == actual_id, col] = val
+                        has_changes = True
+            if has_changes:
+                st.rerun()
+                
+    # Download section
+    st.markdown("### 📥 Kết xuất dữ liệu báo cáo")
+    excel_data = export_to_excel(st.session_state.master_df)
+    
+    st.download_button(
+        label="📥 Tải Báo Cáo Excel Kết Quả Chấm Điểm",
+        data=excel_data,
+        file_name="bao_cao_lead_scoring_bat_dong_san.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        help="Xuất toàn bộ danh sách đã chấm điểm và kiểm duyệt thành file Excel có định dạng chuyên nghiệp."
+    )
+else:
+    st.warning("⚠️ Không thể kết nối và tải dữ liệu từ Google Sheets. Vui lòng kiểm tra lại URL trong thanh cấu hình bên trái.")
