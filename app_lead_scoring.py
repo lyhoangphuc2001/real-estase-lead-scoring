@@ -9,13 +9,16 @@ from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
+import gspread
+from google.oauth2.service_account import Credentials
+import altair as alt
 
 # Load environment variables
 load_dotenv()
 
 # Page configuration
 st.set_page_config(
-    page_title="Real Estate Lead Scoring & Automation",
+    page_title="Real Estate AI Lead Scoring",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -34,31 +37,31 @@ html, body, [class*="css"] {
     background: linear-gradient(135deg, #10B981, #3B82F6);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
-    font-size: 2.5rem;
+    font-size: 2.3rem;
     font-weight: 700;
-    margin-bottom: 0.2rem;
-    text-shadow: 0px 4px 20px rgba(16, 185, 129, 0.1);
+    margin-bottom: 0.1rem;
+    text-shadow: 0px 4px 20px rgba(16, 185, 129, 0.05);
 }
 
 .sub-title {
     color: #6B7280;
-    font-size: 1.1rem;
-    margin-bottom: 2rem;
+    font-size: 1.05rem;
+    margin-bottom: 1.5rem;
     font-weight: 400;
 }
 
 .kpi-container {
     display: flex;
     gap: 1rem;
-    margin-bottom: 1.5rem;
+    margin-bottom: 1rem;
 }
 
 .kpi-card {
     flex: 1;
     background: white;
     border-radius: 16px;
-    padding: 1.25rem;
-    box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05);
+    padding: 1.2rem;
+    box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.04);
     border: 1px solid #F3F4F6;
     text-align: center;
     transition: transform 0.2s ease, box-shadow 0.2s ease;
@@ -66,7 +69,7 @@ html, body, [class*="css"] {
 
 .kpi-card:hover {
     transform: translateY(-2px);
-    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.08);
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.07);
 }
 
 .kpi-card-total { border-top: 5px solid #6B7280; }
@@ -75,7 +78,7 @@ html, body, [class*="css"] {
 .kpi-card-junk { border-top: 5px solid #EF4444; }
 
 .kpi-title {
-    font-size: 0.85rem;
+    font-size: 0.82rem;
     color: #4B5563;
     font-weight: 600;
     text-transform: uppercase;
@@ -84,7 +87,7 @@ html, body, [class*="css"] {
 }
 
 .kpi-value {
-    font-size: 2.2rem;
+    font-size: 2.1rem;
     font-weight: 700;
     margin: 0;
 }
@@ -99,10 +102,10 @@ html, body, [class*="css"] {
     .kpi-card {
         background: #1F2937;
         border-color: #374151;
-        box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.3);
+        box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.25);
     }
     .kpi-card:hover {
-        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.35);
     }
     .kpi-title {
         color: #9CA3AF;
@@ -126,45 +129,96 @@ def get_csv_url(sheet_url):
             pass
     return sheet_url
 
-# Helper to fetch data with caching
-@st.cache_data(show_spinner="Đang tải dữ liệu từ Google Sheets...")
-def load_sheet_data(url):
-    csv_url = get_csv_url(url)
+# Load Google Sheet using public download or private service account credential
+@st.cache_data(show_spinner="Đang kết nối và tải dữ liệu Google Sheets...")
+def load_sheet_data_secure(url):
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds = None
+    
+    # 1. Try reading credentials from st.secrets (recommended for Streamlit Cloud)
     try:
-        # Use urllib to set headers and read CSV
+        if "gcp_service_account" in st.secrets:
+            creds_info = st.secrets["gcp_service_account"]
+            if isinstance(creds_info, str):
+                creds_info = json.loads(creds_info)
+            creds = Credentials.from_service_account_info(creds_info, scopes=scope)
+    except Exception as e:
+        # Suppress error if secrets file is missing locally
+        pass
+            
+    # 2. Try reading credentials from a local file
+    if creds is None and os.path.exists("google_credentials.json"):
+        try:
+            creds = Credentials.from_service_account_file("google_credentials.json", scopes=scope)
+        except Exception as e:
+            st.sidebar.warning(f"Lỗi đọc file google_credentials.json: {e}")
+            
+    # 3. Connect to Private Sheet if Credentials exist
+    if creds is not None:
+        try:
+            client = gspread.authorize(creds)
+            if "docs.google.com/spreadsheets" in url:
+                parts = url.split("/d/")
+                if len(parts) > 1:
+                    sheet_id = parts[1].split("/")[0]
+                    sheet = client.open_by_key(sheet_id)
+                    worksheet = sheet.get_worksheet(0)
+                    data = worksheet.get_all_records()
+                    
+                    df = pd.DataFrame(data)
+                    df.columns = [col.strip() for col in df.columns]
+                    
+                    # Standardize column structure
+                    required = ['id', 'ten_khach', 'sdt', 'nhu_cau_mo_ta']
+                    missing = [c for c in required if c not in df.columns]
+                    if missing:
+                        st.error(f"⚠️ Cột bắt buộc bị thiếu trong Sheet: {', '.join(missing)}")
+                        return None, None
+                        
+                    return df, "private"
+        except Exception as e:
+            st.sidebar.warning(f"⚠️ Không truy cập được dạng Riêng Tư. Lỗi: {e}. Đang thử chế độ Công Khai...")
+            
+    # 4. Fallback: Public URL Download
+    try:
+        csv_url = get_csv_url(url)
         req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req) as response:
             csv_data = response.read().decode('utf-8')
             
         df = pd.read_csv(io.StringIO(csv_data))
         
-        # Check required columns
         required = ['id', 'ten_khach', 'sdt', 'nhu_cau_mo_ta']
         missing = [col for col in required if col not in df.columns]
         if missing:
-            st.error(f"Google Sheet thiếu các cột bắt buộc: {', '.join(missing)}")
-            return None
+            st.error(f"⚠️ Google Sheet thiếu các cột bắt buộc: {', '.join(missing)}")
+            return None, None
             
-        # Add default AI columns if not present
-        if 'diem' not in df.columns:
-            df['diem'] = 0
-        else:
-            df['diem'] = df['diem'].fillna(0).astype(int)
-            
-        if 'phan_loai' not in df.columns:
-            df['phan_loai'] = "Bình thường"
-        else:
-            df['phan_loai'] = df['phan_loai'].fillna("Bình thường")
-            
-        if 'ly_do_chi_tiet' not in df.columns:
-            df['ly_do_chi_tiet'] = "Chưa chấm điểm (Chưa chạy AI/Rule)"
-        else:
-            df['ly_do_chi_tiet'] = df['ly_do_chi_tiet'].fillna("Chưa chấm điểm (Chưa chạy AI/Rule)")
-            
-        return df
+        return df, "public"
     except Exception as e:
-        st.error(f"Không thể tải dữ liệu từ URL Google Sheet. Chi tiết lỗi: {str(e)}")
+        st.error(f"❌ Không thể tải dữ liệu. Lỗi: {str(e)}")
+        return None, None
+
+# Normalize fields helper
+def normalize_dataframe(df):
+    if df is None:
         return None
+    df_copy = df.copy()
+    if 'diem' not in df_copy.columns:
+        df_copy['diem'] = 0
+    else:
+        df_copy['diem'] = df_copy['diem'].fillna(0).astype(int)
+        
+    if 'phan_loai' not in df_copy.columns:
+        df_copy['phan_loai'] = "Bình thường"
+    else:
+        df_copy['phan_loai'] = df_copy['phan_loai'].fillna("Bình thường")
+        
+    if 'ly_do_chi_tiet' not in df_copy.columns:
+        df_copy['ly_do_chi_tiet'] = "Chưa chấm điểm (Chưa chạy AI/Rule)"
+    else:
+        df_copy['ly_do_chi_tiet'] = df_copy['ly_do_chi_tiet'].fillna("Chưa chấm điểm (Chưa chạy AI/Rule)")
+    return df_copy
 
 # Rule-based offline scoring logic
 def rule_based_score(description_text):
@@ -288,7 +342,6 @@ def export_to_excel(df):
     wb = Workbook()
     ws = wb.active
     ws.title = "Lead Scoring Reports"
-    
     ws.views.sheetView[0].showGridLines = True
     
     headers = ["ID", "Tên Khách Hàng", "Số Điện Thoại", "Mô Tả Nhu Cầu", "Điểm Số", "Phân Loại", "Lý Do Chi Tiết"]
@@ -334,12 +387,12 @@ def export_to_excel(df):
             cell.border = cell_border
             cell.font = Font(name="Segoe UI", size=10)
             
-            if col_idx in [1, 3, 5, 6]:  # ID, SĐT, Điểm, Phân Loại
+            if col_idx in [1, 3, 5, 6]:
                 cell.alignment = Alignment(horizontal="center", vertical="center")
             else:
                 cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
                 
-            if col_idx == 6:  # Phân loại highlight
+            if col_idx == 6:
                 val = str(cell.value)
                 if val == "VIP":
                     cell.fill = vip_fill
@@ -351,16 +404,7 @@ def export_to_excel(df):
                     cell.fill = normal_fill
                     cell.font = normal_font
                     
-    column_widths = {
-        1: 8,   # ID
-        2: 22,  # Tên Khách Hàng
-        3: 15,  # SĐT
-        4: 55,  # Mô Tả Nhu Cầu
-        5: 10,  # Điểm Số
-        6: 15,  # Phân Loại
-        7: 45   # Lý Do Chi Tiết
-    }
-    
+    column_widths = {1: 8, 2: 22, 3: 15, 4: 55, 5: 10, 6: 15, 7: 45}
     for col_idx, width in column_widths.items():
         col_letter = get_column_letter(col_idx)
         ws.column_dimensions[col_letter].width = width
@@ -369,46 +413,57 @@ def export_to_excel(df):
     output.seek(0)
     return output.getvalue()
 
-# Sidebar Setup
-st.sidebar.markdown("### ⚙️ Cấu HÌnh Hệ Thống")
+# SIDEBAR CONFIGURATION
+st.sidebar.markdown("### ⚙️ Cấu Hình Hệ Thống")
 
-# Google Sheet link setup
 default_sheet = "https://docs.google.com/spreadsheets/d/1joAy1H6PU19kwgsn57CSk_8cdci6vcDmME21CV_4n6E/edit?usp=sharing"
 sheet_url = st.sidebar.text_input(
     "URL Google Sheets:",
     value=default_sheet,
-    help="Dán URL Google Sheet chứa danh sách khách hàng của bạn."
+    help="Hỗ trợ link công khai hoặc riêng tư (khi cấu hình Service Account)."
 )
 
-# API key setup
 gemini_key = st.sidebar.text_input(
     "Gemini API Key (Không bắt buộc):",
     value=os.getenv("GEMINI_API_KEY", ""),
     type="password",
-    help="Nếu bỏ trống, hệ thống sẽ tự động chạy thuật toán Rule-Based Offline mà không báo lỗi."
+    help="Nếu bỏ trống, hệ thống sẽ tự động sử dụng thuật toán quy tắc offline."
 )
 
-# Load data into session state
+# Connect to google sheets and cache
 if "master_df" not in st.session_state:
-    df_raw = load_sheet_data(sheet_url)
+    df_raw, connection_type = load_sheet_data_secure(sheet_url)
     if df_raw is not None:
-        st.session_state.master_df = df_raw.copy()
-        st.session_state.original_df = df_raw.copy()
+        df_norm = normalize_dataframe(df_raw)
+        st.session_state.master_df = df_norm.copy()
+        st.session_state.original_df = df_norm.copy()
+        st.session_state.connection_status = connection_type
     else:
         st.session_state.master_df = None
         st.session_state.original_df = None
+        st.session_state.connection_status = None
 
-# Refresh button to force clear cache and re-download
-if st.sidebar.button("🔄 Tải lại/Đồng bộ Google Sheets", use_container_width=True):
+# Refresh button
+if st.sidebar.button("🔄 Đồng bộ Google Sheets", use_container_width=True):
     st.cache_data.clear()
-    df_raw = load_sheet_data(sheet_url)
+    df_raw, connection_type = load_sheet_data_secure(sheet_url)
     if df_raw is not None:
-        st.session_state.master_df = df_raw.copy()
-        st.session_state.original_df = df_raw.copy()
-        st.success("Đồng bộ Google Sheet thành công!")
+        df_norm = normalize_dataframe(df_raw)
+        st.session_state.master_df = df_norm.copy()
+        st.session_state.original_df = df_norm.copy()
+        st.session_state.connection_status = connection_type
+        st.success("Đồng bộ thành công!")
         st.rerun()
 
-# Default prompt template editable in sidebar
+# Display connection status badge
+if st.session_state.connection_status == "private":
+    st.sidebar.success("🟢 Trạng thái: Kết nối Riêng Tư (Secure)")
+elif st.session_state.connection_status == "public":
+    st.sidebar.info("🔵 Trạng thái: Chế độ Công Khai (Public)")
+else:
+    st.sidebar.error("🔴 Trạng thái: Chưa có dữ liệu")
+
+# AI System Prompt Customizer
 st.sidebar.markdown("### 📝 AI System Prompt Customizer")
 default_prompt = """Bạn là chuyên gia phân tích dữ liệu và chấm điểm khách hàng tiềm năng (Lead Scoring) trong ngành Bất Động Sản.
 Nhiệm vụ của bạn là phân tích đoạn mô tả nhu cầu khách hàng dưới đây và đưa ra đánh giá dựa trên bộ quy tắc chính xác sau:
@@ -457,7 +512,6 @@ if st.sidebar.button("⚡ Chạy thuật toán chấm điểm (Lead Scoring)", u
     if st.session_state.master_df is None:
         st.sidebar.error("⚠️ Không có dữ liệu khách hàng để chấm điểm!")
     else:
-        # Master storage copy
         df_to_score = st.session_state.master_df.copy()
         total_leads = len(df_to_score)
         
@@ -465,25 +519,22 @@ if st.sidebar.button("⚡ Chạy thuật toán chấm điểm (Lead Scoring)", u
         status_text = st.sidebar.empty()
         
         if not gemini_key:
-            # ----------------- OFFLINE RULE-BASED SCORING ENGINE -----------------
+            # Running offline matching
             status_text.text("⚡ Đang chạy thuật toán Rule-Based Offline...")
             for i in range(total_leads):
                 row = df_to_score.iloc[i]
-                
                 score, classification, reason = rule_based_score(row['nhu_cau_mo_ta'])
-                
                 df_to_score.at[i, 'diem'] = score
                 df_to_score.at[i, 'phan_loai'] = classification
                 df_to_score.at[i, 'ly_do_chi_tiet'] = reason
-                
                 progress_bar.progress((i + 1) / total_leads)
                 
             st.session_state.master_df = df_to_score.copy()
             status_text.text("🎉 Đã hoàn tất chấm điểm offline!")
-            st.info("ℹ️ Hệ thống đã chấm điểm offline thành công bằng quy tắc nghiệp vụ (không cần Gemini API Key)!")
+            st.info("ℹ️ Chấm điểm offline bằng quy tắc nghiệp vụ thành công!")
             st.rerun()
         else:
-            # ----------------- ONLINE GEMINI SCORING ENGINE -----------------
+            # Running online Gemini
             try:
                 genai.configure(api_key=gemini_key)
                 model = genai.GenerativeModel("gemini-1.5-flash")
@@ -491,83 +542,92 @@ if st.sidebar.button("⚡ Chạy thuật toán chấm điểm (Lead Scoring)", u
                 for i in range(total_leads):
                     row = df_to_score.iloc[i]
                     status_text.text(f"Đang phân tích AI {i+1}/{total_leads}: {row['ten_khach']}")
-                    
                     score, classification, reason = score_single_lead(
                         model,
                         row['ten_khach'],
                         row['nhu_cau_mo_ta'],
                         system_prompt
                     )
-                    
                     df_to_score.at[i, 'diem'] = score
                     df_to_score.at[i, 'phan_loai'] = classification
                     df_to_score.at[i, 'ly_do_chi_tiet'] = reason
-                    
                     progress_bar.progress((i + 1) / total_leads)
                     
                 st.session_state.master_df = df_to_score.copy()
                 status_text.text("🎉 Đã hoàn tất chấm điểm bằng AI!")
-                st.success("Đã chấm điểm thành công bằng mô hình Gemini!")
+                st.success("Chấm điểm thành công bằng mô hình Gemini!")
                 st.rerun()
             except Exception as e:
-                st.sidebar.error(f"Lỗi hệ thống khi gọi AI: {str(e)}")
+                st.sidebar.error(f"Lỗi gọi AI: {str(e)}")
 
 # MAIN INTERFACE
-st.markdown('<div class="main-title">🎯 AI Lead Scoring & Automation System</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Phân tích nhu cầu khách hàng, tự động chấm điểm và kiểm duyệt Human-in-the-Loop</div>', unsafe_allow_html=True)
+# Render Branding Banner
+if os.path.exists("real_estate_ai_banner.png"):
+    st.image("real_estate_ai_banner.png", use_container_width=True)
+
+st.markdown('<div class="main-title">🎯 AI Lead Scoring & Automation Dashboard</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Bảo mật truy xuất nguồn dữ liệu và giao diện báo cáo chuyên sâu</div>', unsafe_allow_html=True)
 
 if st.session_state.master_df is not None:
-    # Compute dynamic statistics from master_df
     df_stats = st.session_state.master_df
     total_count = len(df_stats)
     vip_count = len(df_stats[df_stats['phan_loai'] == 'VIP'])
     normal_count = len(df_stats[df_stats['phan_loai'] == 'Bình thường'])
     junk_count = len(df_stats[df_stats['phan_loai'] == 'Rác'])
     
-    # Render premium metrics cards
-    st.markdown(f"""
-    <div class="kpi-container">
-        <div class="kpi-card kpi-card-total">
-            <div class="kpi-title">Tổng số khách hàng</div>
-            <div class="kpi-value kpi-value-total">{total_count}</div>
-        </div>
-        <div class="kpi-card kpi-card-vip">
-            <div class="kpi-title">Khách hàng VIP / Siêu Tiềm Năng</div>
-            <div class="kpi-value kpi-value-vip">{vip_count}</div>
-        </div>
-        <div class="kpi-card kpi-card-normal">
-            <div class="kpi-title">Tiềm năng trung bình</div>
-            <div class="kpi-value kpi-value-normal">{normal_count}</div>
-        </div>
-        <div class="kpi-card kpi-card-junk">
-            <div class="kpi-title">Khách Rác / Không Tiềm Năng</div>
-            <div class="kpi-value kpi-value-junk">{junk_count}</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Grid: KPIs left, Chart right
+    col_kpi, col_chart = st.columns([3, 2])
     
-    # Business Rules Expander
-    with st.expander("📖 Xem Quy tắc & Hướng dẫn chấm điểm nghiệp vụ (Business Rules)", expanded=False):
-        st.markdown("""
-        **1. TIÊU CHÍ CỘNG 50 ĐIỂM (KHÁCH HÀNG VIP/SIÊU TIỀM NĂNG)**
-        - **Ngân sách lớn**: >= 20 tỷ VNĐ hoặc các cụm từ: "tài chính mạnh", "ngân sách không thành vấn đề".
-        - **Loại hình cao cấp**: "Biệt thự đơn lập", "Penthouse", "Shophouse mặt đường lớn", "Quỹ đất công nghiệp", "Sàn văn phòng diện tích lớn".
-        - **Vị trí đắc địa**: "Quận 1", "Ven sông", "Vinhomes Ocean Park", "Phú Mỹ Hưng".
-        - **Đối tượng khách hàng**: "Chủ doanh nghiệp", "Nhà đầu tư chuyên nghiệp", "Mua sỉ", "Mua số lượng lớn".
-        - **Tính cấp thiết & Minh bạch**: "Pháp lý chuẩn 100%", "Sổ hồng riêng", "Muốn gặp trực tiếp chủ đầu tư để đàm phán".
+    with col_kpi:
+        # Render premium metrics cards
+        st.markdown(f"""
+        <div class="kpi-container">
+            <div class="kpi-card kpi-card-total">
+                <div class="kpi-title">Tổng số lead</div>
+                <div class="kpi-value kpi-value-total">{total_count}</div>
+            </div>
+            <div class="kpi-card kpi-card-vip">
+                <div class="kpi-title">Khách VIP</div>
+                <div class="kpi-value kpi-value-vip">{vip_count}</div>
+            </div>
+        </div>
+        <div class="kpi-container">
+            <div class="kpi-card kpi-card-normal">
+                <div class="kpi-title">Bình thường</div>
+                <div class="kpi-value kpi-value-normal">{normal_count}</div>
+            </div>
+            <div class="kpi-card kpi-card-junk">
+                <div class="kpi-title">Khách Rác</div>
+                <div class="kpi-value kpi-value-junk">{junk_count}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         
-        **2. TIÊU CHÍ TRỪ 50 ĐIỂM (KHÁCH HÀNG RÁC/KHÔNG TIỀM NĂNG)**
-        - **Yêu cầu phi thực tế**: Mua bđs giá thấp vô lý (VD: Nhà Q1 giá 1-2 tỷ, nhà trung tâm có sân vườn hồ bơi giá vài trăm triệu, thuê nhà trung tâm giá 2 triệu).
-        - **Không có nhu cầu**: "Nhầm số", "Không có nhu cầu", "Dữ liệu cũ", "Nhầm ngành".
-        - **Khách không thiện chí**: "Hỏi giá cho vui", "Chưa có ý định mua", "Thái độ không hợp tác".
-        - **Spam/Quảng cáo**: "Bảo hiểm", "Vay vốn", "Mời chào dịch vụ".
-        - **Thông tin lỗi**: "Thuê bao", "Gọi nhiều lần không bắt máy", "Không phản hồi Zalo".
+    with col_chart:
+        # Create horizontal bar chart using Altair
+        chart_data = pd.DataFrame({
+            'Phân loại': ['VIP', 'Bình thường', 'Rác'],
+            'Số lượng': [vip_count, normal_count, junk_count]
+        })
         
-        **3. CÁC TRƯỜNG HỢP KHÁC (GIỮ NGUYÊN 0 ĐIỂM)**
-        - Chung cư, nhà phố tầm trung (3-10 tỷ).
-        - Khách cần vay ngân hàng, đang cân nhắc chính sách.
-        - Khách có nhu cầu thực nhưng cần tư vấn thêm về pháp lý hoặc vị trí.
-        """)
+        chart = alt.Chart(chart_data).mark_bar(cornerRadiusEnd=8, size=24).encode(
+            x=alt.X('Số lượng:Q', title='Số lượng lead'),
+            y=alt.Y('Phân loại:N', sort=['VIP', 'Bình thường', 'Rác'], title=None),
+            color=alt.Color('Phân loại:N', scale=alt.Scale(
+                domain=['VIP', 'Bình thường', 'Rác'],
+                range=['#10B981', '#3B82F6', '#EF4444']
+            ), legend=None)
+        ).properties(
+            height=160,
+            title="Biểu đồ phân loại khách hàng"
+        ).configure_title(
+            fontSize=14,
+            font='Plus Jakarta Sans',
+            anchor='start',
+            color='#4B5563'
+        )
+        
+        st.altair_chart(chart, use_container_width=True)
         
     # Filters Section
     st.markdown("### 🔍 Bộ lọc & Kiểm duyệt kết quả (Human-In-The-Loop)")
@@ -582,7 +642,7 @@ if st.session_state.master_df is not None:
     with col_reset:
         st.write(" ")
         st.write(" ")
-        if st.button("🔄 Khôi phục dữ liệu ban đầu", use_container_width=True, help="Hủy bỏ mọi thay đổi chỉnh sửa thủ công"):
+        if st.button("🔄 Khôi phục dữ liệu ban đầu", use_container_width=True):
             st.session_state.master_df = st.session_state.original_df.copy()
             st.success("Đã khôi phục dữ liệu gốc!")
             st.rerun()
@@ -661,7 +721,7 @@ if st.session_state.master_df is not None:
     excel_data = export_to_excel(st.session_state.master_df)
     
     st.download_button(
-        label="📥 Tải Báo Cáo Excel Kết Quả Chấm Điểm",
+        label="📥 Tải Báo Cáo Excel Kết Quả Chấm Điểm (Bàn Giao)",
         data=excel_data,
         file_name="bao_cao_lead_scoring_bat_dong_san.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -669,4 +729,4 @@ if st.session_state.master_df is not None:
         help="Xuất toàn bộ danh sách đã chấm điểm và kiểm duyệt thành file Excel có định dạng chuyên nghiệp."
     )
 else:
-    st.warning("⚠️ Không thể kết nối và tải dữ liệu từ Google Sheets. Vui lòng kiểm tra lại URL trong thanh cấu hình bên trái.")
+    st.warning("⚠️ Không thể kết nối và tải dữ liệu từ Google Sheets. Vui lòng kiểm tra cấu hình trong sidebar.")

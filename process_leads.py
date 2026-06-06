@@ -1,9 +1,13 @@
 import pandas as pd
 import io
 import urllib.request
+import os
+import json
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
+import gspread
+from google.oauth2.service_account import Credentials
 
 def get_csv_url(sheet_url):
     if "docs.google.com/spreadsheets" in sheet_url:
@@ -15,6 +19,41 @@ def get_csv_url(sheet_url):
         except Exception:
             pass
     return sheet_url
+
+def load_sheet_data_secure(url):
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds = None
+    
+    # 1. Try reading credentials from a local file
+    if os.path.exists("google_credentials.json"):
+        try:
+            print("🔑 Tìm thấy file google_credentials.json, đang kết nối Google Sheets API...")
+            creds = Credentials.from_service_account_file("google_credentials.json", scopes=scope)
+            client = gspread.authorize(creds)
+            
+            if "docs.google.com/spreadsheets" in url:
+                parts = url.split("/d/")
+                if len(parts) > 1:
+                    sheet_id = parts[1].split("/")[0]
+                    sheet = client.open_by_key(sheet_id)
+                    worksheet = sheet.get_worksheet(0)
+                    data = worksheet.get_all_records()
+                    
+                    df = pd.DataFrame(data)
+                    df.columns = [col.strip() for col in df.columns]
+                    print("🔒 Kết nối thành công Google Sheet Riêng Tư bằng Service Account!")
+                    return df
+        except Exception as e:
+            print(f"⚠️ Cảnh báo: Lỗi kết nối Riêng Tư: {e}. Đang chuyển sang đọc Công Khai...")
+            
+    # 2. Fallback: Public URL Download
+    print("🌐 Đang tải dữ liệu Google Sheet ở chế độ đọc Công Khai (Public CSV)...")
+    csv_url = get_csv_url(url)
+    req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req) as response:
+        csv_data = response.read().decode('utf-8')
+    df = pd.read_csv(io.StringIO(csv_data))
+    return df
 
 def rule_based_score(description_text):
     desc = str(description_text).lower()
@@ -201,19 +240,10 @@ def export_to_excel(df, filename):
 
 def main():
     sheet_url = "https://docs.google.com/spreadsheets/d/1joAy1H6PU19kwgsn57CSk_8cdci6vcDmME21CV_4n6E/edit?usp=sharing"
-    csv_url = get_csv_url(sheet_url)
     
-    print("📥 Đang tải dữ liệu từ Google Sheets...")
-    try:
-        # Fetch CSV using urllib
-        req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
-            csv_data = response.read().decode('utf-8')
-            
-        df = pd.read_csv(io.StringIO(csv_data))
-        print(f"📊 Đã tải thành công {len(df)} dòng dữ liệu.")
-    except Exception as e:
-        print(f"❌ Lỗi khi tải dữ liệu: {e}")
+    df = load_sheet_data_secure(sheet_url)
+    if df is None:
+        print("❌ Lỗi khi tải dữ liệu. Kết thúc chương trình.")
         return
 
     # Check required columns
@@ -223,7 +253,7 @@ def main():
             print(f"❌ Sheet thiếu cột bắt buộc: {col}")
             return
             
-    # Process leads using rules
+    print(f"📊 Đã tải thành công {len(df)} dòng dữ liệu.")
     print("⚡ Đang bắt đầu chấm điểm khách hàng dựa trên quy tắc nghiệp vụ offline...")
     
     scores = []
