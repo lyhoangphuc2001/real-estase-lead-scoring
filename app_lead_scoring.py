@@ -4,6 +4,7 @@ import google.generativeai as genai
 import json
 import io
 import os
+import urllib.request
 from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -130,7 +131,13 @@ def get_csv_url(sheet_url):
 def load_sheet_data(url):
     csv_url = get_csv_url(url)
     try:
-        df = pd.read_csv(csv_url)
+        # Use urllib to set headers and read CSV
+        req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            csv_data = response.read().decode('utf-8')
+            
+        df = pd.read_csv(io.StringIO(csv_data))
+        
         # Check required columns
         required = ['id', 'ten_khach', 'sdt', 'nhu_cau_mo_ta']
         missing = [col for col in required if col not in df.columns]
@@ -150,14 +157,114 @@ def load_sheet_data(url):
             df['phan_loai'] = df['phan_loai'].fillna("Bình thường")
             
         if 'ly_do_chi_tiet' not in df.columns:
-            df['ly_do_chi_tiet'] = "Chưa chấm điểm (Chưa chạy AI)"
+            df['ly_do_chi_tiet'] = "Chưa chấm điểm (Chưa chạy AI/Rule)"
         else:
-            df['ly_do_chi_tiet'] = df['ly_do_chi_tiet'].fillna("Chưa chấm điểm (Chưa chạy AI)")
+            df['ly_do_chi_tiet'] = df['ly_do_chi_tiet'].fillna("Chưa chấm điểm (Chưa chạy AI/Rule)")
             
         return df
     except Exception as e:
         st.error(f"Không thể tải dữ liệu từ URL Google Sheet. Chi tiết lỗi: {str(e)}")
         return None
+
+# Rule-based offline scoring logic
+def rule_based_score(description_text):
+    desc = str(description_text).lower()
+    
+    # 1. CHECK JUNK / RÁC RULES (-50 POINTS)
+    is_junk = False
+    reasons = []
+    
+    # Unrealistic price
+    if (("giá 1-2 tỷ" in desc or "1 tỷ" in desc or "2 tỷ" in desc) and "quận 1" in desc) or \
+       ("trung tâm" in desc and "vài trăm triệu" in desc) or \
+       ("thuê nguyên căn" in desc and "2 triệu" in desc) or \
+       ("trung tâm thành phố" in desc and "2 triệu" in desc):
+        is_junk = True
+        reasons.append("Yêu cầu phi thực tế về giá cả")
+        
+    # No demand
+    if "nhầm số" in desc or "không có nhu cầu" in desc or "dữ liệu cũ" in desc or "nhầm ngành" in desc:
+        is_junk = True
+        reasons.append("Khách hàng không có nhu cầu hoặc nhầm số/dữ liệu cũ")
+        
+    # No goodwill
+    if "hỏi giá cho vui" in desc or "chưa có ý định mua" in desc or "thái độ không hợp tác" in desc:
+        is_junk = True
+        reasons.append("Khách hàng không thiện chí/hỏi giá cho vui")
+        
+    # Spam/Advertising
+    if "spam" in desc or "quảng cáo" in desc or "bảo hiểm" in desc or "mời chào" in desc or "vay vốn" in desc:
+        is_junk = True
+        reasons.append("Nội dung spam hoặc quảng cáo ngược")
+        
+    # Contact error
+    if "thuê bao" in desc or "không bắt máy" in desc or "không phản hồi" in desc or "gọi nhiều lần" in desc:
+        is_junk = True
+        reasons.append("Thông tin liên lạc lỗi (thuê bao/không nghe máy)")
+        
+    if is_junk:
+        return -50, "Rác", " | ".join(reasons)
+        
+    # 2. CHECK VIP / SIÊU TIỀM NĂNG RULES (+50 POINTS)
+    is_vip = False
+    vip_reasons = []
+    
+    # Check if this is a mid-range case that should be overridden to Normal (0 points)
+    is_mid_range = False
+    if "đất nền vùng ven" in desc or "long an" in desc or "đồng nai" in desc or "2-3 tỷ" in desc:
+        is_mid_range = True
+    if "căn hộ 2pn" in desc or "quận 7" in desc or "4-5 tỷ" in desc or "gia đình trẻ" in desc:
+        is_mid_range = True
+    if "thuê mặt bằng" in desc and "dưới 50 triệu" in desc:
+        is_mid_range = True
+        
+    if not is_mid_range:
+        # Large budget
+        if "tài chính cực mạnh" in desc or "tài chính mạnh" in desc or "không thành vấn đề" in desc or \
+           "trên 30 tỷ" in desc or "thanh toán thẳng" in desc or "20 tỷ" in desc or "ngân sách lớn" in desc:
+            is_vip = True
+            vip_reasons.append("Tài chính lớn/cực mạnh")
+            
+        # Premium property type
+        if "biệt thự đơn lập" in desc or "penthouse" in desc or "shophouse mặt đường lớn" in desc or \
+           "quỹ đất công nghiệp" in desc or "sàn văn phòng diện tích lớn" in desc or "trên 2000m2" in desc:
+            is_vip = True
+            vip_reasons.append("Quan tâm sản phẩm bất động sản cao cấp")
+            
+        # Prime location
+        if ("vinhomes ocean park" in desc or "phú mỹ hưng" in desc or "ven sông" in desc or "khu đông" in desc or "quận 1" in desc) and \
+           ("vip" in desc or "biệt thự" in desc or "shophouse" in desc or "doanh nghiệp" in desc or "tài chính" in desc or "sỉ" in desc or "sàn văn phòng" in desc):
+            is_vip = True
+            vip_reasons.append("Vị trí đắc địa / Khu vực cao cấp")
+            
+        # Target client
+        if "chủ doanh nghiệp" in desc or "nhà đầu tư chuyên nghiệp" in desc or "mua sỉ" in desc or "gom sỉ" in desc or "số lượng lớn" in desc:
+            is_vip = True
+            vip_reasons.append("Khách hàng là Chủ doanh nghiệp / Nhà đầu tư sỉ")
+            
+        # Urgency & Transparency
+        if "pháp lý chuẩn 100%" in desc or "sổ hồng riêng" in desc or "gặp trực tiếp chủ đầu tư" in desc or "gặp trực tiếp giám đốc" in desc:
+            is_vip = True
+            vip_reasons.append("Yêu cầu pháp lý cao và giao dịch trực tiếp")
+            
+    if is_vip:
+        return 50, "VIP", " | ".join(vip_reasons)
+        
+    # 3. DEFAULT: NORMAL / TIỀM NĂNG TRUNG BÌNH (0 POINTS)
+    normal_reasons = []
+    if "đất nền" in desc or "long an" in desc or "đồng nai" in desc:
+        normal_reasons.append("Khách mua đất nền vùng ven tầm trung")
+    elif "căn hộ" in desc or "chung cư" in desc:
+        normal_reasons.append("Khách mua chung cư tầm trung")
+    elif "thuê mặt bằng" in desc:
+        normal_reasons.append("Khách thuê mặt bằng kinh doanh")
+    else:
+        normal_reasons.append("Khách hàng có nhu cầu bất động sản thông thường")
+        
+    if "vay ngân hàng" in desc or "vay" in desc:
+        normal_reasons.append("cần hỗ trợ tài chính/vay ngân hàng")
+        
+    return 0, "Bình thường", " - ".join(normal_reasons)
 
 # Helper to score a single lead using Gemini API
 def score_single_lead(model, client_name, desc, prompt_template):
@@ -263,7 +370,7 @@ def export_to_excel(df):
     return output.getvalue()
 
 # Sidebar Setup
-st.sidebar.markdown("### ⚙️ Cấu Hình Hệ Thống")
+st.sidebar.markdown("### ⚙️ Cấu HÌnh Hệ Thống")
 
 # Google Sheet link setup
 default_sheet = "https://docs.google.com/spreadsheets/d/1joAy1H6PU19kwgsn57CSk_8cdci6vcDmME21CV_4n6E/edit?usp=sharing"
@@ -275,10 +382,10 @@ sheet_url = st.sidebar.text_input(
 
 # API key setup
 gemini_key = st.sidebar.text_input(
-    "Gemini API Key:",
+    "Gemini API Key (Không bắt buộc):",
     value=os.getenv("GEMINI_API_KEY", ""),
     type="password",
-    help="Nhập Gemini API Key của bạn để sử dụng trí tuệ nhân tạo."
+    help="Nếu bỏ trống, hệ thống sẽ tự động chạy thuật toán Rule-Based Offline mà không báo lỗi."
 )
 
 # Load data into session state
@@ -341,38 +448,29 @@ Hãy trả về kết quả dưới dạng JSON duy nhất với cấu trúc sau
 system_prompt = st.sidebar.text_area(
     "AI Prompt Template:",
     value=default_prompt,
-    height=250,
-    help="Bạn có thể chỉnh sửa cấu trúc chấm điểm AI tại đây trước khi chạy."
+    height=200,
+    help="Dùng cho mô hình AI khi có Gemini API Key."
 )
 
-# Run AI scoring button
-if st.sidebar.button("⚡ Chạy AI Chấm Điểm (Lead Scoring)", use_container_width=True):
-    if not gemini_key:
-        st.sidebar.error("⚠️ Vui lòng cung cấp Gemini API Key để tiếp tục!")
-    elif st.session_state.master_df is None:
+# Run scoring button
+if st.sidebar.button("⚡ Chạy thuật toán chấm điểm (Lead Scoring)", use_container_width=True):
+    if st.session_state.master_df is None:
         st.sidebar.error("⚠️ Không có dữ liệu khách hàng để chấm điểm!")
     else:
-        try:
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            
-            # Master storage copy
-            df_to_score = st.session_state.master_df.copy()
-            
-            total_leads = len(df_to_score)
-            progress_bar = st.sidebar.progress(0)
-            status_text = st.sidebar.empty()
-            
+        # Master storage copy
+        df_to_score = st.session_state.master_df.copy()
+        total_leads = len(df_to_score)
+        
+        progress_bar = st.sidebar.progress(0)
+        status_text = st.sidebar.empty()
+        
+        if not gemini_key:
+            # ----------------- OFFLINE RULE-BASED SCORING ENGINE -----------------
+            status_text.text("⚡ Đang chạy thuật toán Rule-Based Offline...")
             for i in range(total_leads):
                 row = df_to_score.iloc[i]
-                status_text.text(f"Đang phân tích {i+1}/{total_leads}: {row['ten_khach']}")
                 
-                score, classification, reason = score_single_lead(
-                    model,
-                    row['ten_khach'],
-                    row['nhu_cau_mo_ta'],
-                    system_prompt
-                )
+                score, classification, reason = rule_based_score(row['nhu_cau_mo_ta'])
                 
                 df_to_score.at[i, 'diem'] = score
                 df_to_score.at[i, 'phan_loai'] = classification
@@ -381,11 +479,38 @@ if st.sidebar.button("⚡ Chạy AI Chấm Điểm (Lead Scoring)", use_containe
                 progress_bar.progress((i + 1) / total_leads)
                 
             st.session_state.master_df = df_to_score.copy()
-            status_text.text("🎉 Đã hoàn tất chấm điểm bằng AI!")
-            st.success("Chấm điểm thành công! Hãy kiểm duyệt và hiệu chỉnh kết quả bên dưới.")
+            status_text.text("🎉 Đã hoàn tất chấm điểm offline!")
+            st.info("ℹ️ Hệ thống đã chấm điểm offline thành công bằng quy tắc nghiệp vụ (không cần Gemini API Key)!")
             st.rerun()
-        except Exception as e:
-            st.sidebar.error(f"Lỗi hệ thống: {str(e)}")
+        else:
+            # ----------------- ONLINE GEMINI SCORING ENGINE -----------------
+            try:
+                genai.configure(api_key=gemini_key)
+                model = genai.GenerativeModel("gemini-1.5-flash")
+                
+                for i in range(total_leads):
+                    row = df_to_score.iloc[i]
+                    status_text.text(f"Đang phân tích AI {i+1}/{total_leads}: {row['ten_khach']}")
+                    
+                    score, classification, reason = score_single_lead(
+                        model,
+                        row['ten_khach'],
+                        row['nhu_cau_mo_ta'],
+                        system_prompt
+                    )
+                    
+                    df_to_score.at[i, 'diem'] = score
+                    df_to_score.at[i, 'phan_loai'] = classification
+                    df_to_score.at[i, 'ly_do_chi_tiet'] = reason
+                    
+                    progress_bar.progress((i + 1) / total_leads)
+                    
+                st.session_state.master_df = df_to_score.copy()
+                status_text.text("🎉 Đã hoàn tất chấm điểm bằng AI!")
+                st.success("Đã chấm điểm thành công bằng mô hình Gemini!")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Lỗi hệ thống khi gọi AI: {str(e)}")
 
 # MAIN INTERFACE
 st.markdown('<div class="main-title">🎯 AI Lead Scoring & Automation System</div>', unsafe_allow_html=True)
@@ -473,7 +598,7 @@ if st.session_state.master_df is not None:
         display_df = display_df[display_df['phan_loai'] == filter_class]
         
     # Data editor for human review
-    st.info("💡 Mẹo: Bạn có thể nhấp đôi chuột vào ô **Điểm**, **Phân Loại** hoặc **Lý do chi tiết** bên dưới để chỉnh sửa trực tiếp. Điểm sẽ tự đồng bộ với Phân Loại tương ứng.")
+    st.info("💡 Mẹo: Bạn có thể nhấp đôi chuột vào ô **Điểm số**, **Phân loại** hoặc **Lý do chi tiết (Ghi chú)** bên dưới để chỉnh sửa trực tiếp. Điểm số và phân loại sẽ tự động đồng bộ hóa.")
     
     # Configure columns
     edited_display_df = st.data_editor(
